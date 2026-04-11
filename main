@@ -1,0 +1,221 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+from torchvision import models, transforms
+from torchvision.models import ResNet50_Weights
+
+# ==========================================
+# 1. ЗАГРУЗКА И ПОДГОТОВКА
+# ==========================================
+weights = ResNet50_Weights.IMAGENET1K_V1
+model = models.resnet50(weights=weights).eval()
+
+# Переводим все ReLU в inplace=False, иначе возникают конфликты с autograd и хуками
+for module in model.modules():
+    if isinstance(module, nn.ReLU):
+        module.inplace = False
+
+preprocess = weights.transforms()
+image_path = '/Users/vladharcenko/Desktop/ML/РСК/task2/12-wild-animals-in-nigeria.jpg'
+img_pil = Image.open(image_path).convert('RGB')
+input_tensor = preprocess(img_pil).unsqueeze(0)
+# Тест 1: Проверяем идентичность картинки после пайплайна
+print(f"Сумма пикселей тензора: {input_tensor.sum().item():.5f}")
+print(f"Среднее значение тензора: {input_tensor.mean().item():.5f}")
+print(model.conv1.weight.sum().item())
+with torch.no_grad():
+    preds = model(input_tensor)
+    target_class = preds.argmax(dim=1).item()
+    
+
+
+    
+    # 2. Вероятность (в процентах / долях)
+    probabilities = F.softmax(preds, dim=1)
+    prob_score = probabilities[0, target_class].item()
+    
+    print(f"Класс: {weights.meta['categories'][target_class]}")
+    print(f"Вероятность: {prob_score:.4f} ({prob_score * 100:.2f}%)")
+
+# ==========================================
+# 2. МЕНЕДЖЕР ХУКОВ ДЛЯ СЛОЕВ (Перехватчик)
+# ==========================================
+class LayerExtractor:
+    def __init__(self, model, layers_dict):
+        self.layers_dict = layers_dict
+        self.gradients = {name: 0.0 for name in layers_dict}
+        self.activations = {name: None for name in layers_dict}
+        self.hooks = []
+        
+        # Вешаем хуки на нужные слои
+        for name, layer in self.layers_dict.items():
+            self.hooks.append(layer.register_forward_hook(self.save_activation(name)))
+            self.hooks.append(layer.register_full_backward_hook(self.save_gradient(name)))
+            
+    def save_activation(self, name):
+        def hook(module, inp, out):
+            self.activations[name] = out.detach()
+        return hook
+        
+    def save_gradient(self, name):
+        def hook(module, grad_in, grad_out):
+            # Перехватываем градиент, идущий через слой
+            if isinstance(self.gradients[name], float):
+                self.gradients[name] = grad_out[0].detach()
+            else:
+                self.gradients[name] += grad_out[0].detach()
+        return hook
+        
+    def clear_gradients(self):
+        for name in self.gradients:
+            self.gradients[name] = 0.0
+            
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+
+# Указываем те самые 3 слоя из конца макро-блока
+target_layers = {
+    "Слой 2": model.layer2,
+    "Слой 3": model.layer3,
+    "Слой 4": model.layer4
+}
+extractor = LayerExtractor(model, target_layers)
+
+# ==========================================
+# 3. АЛГОРИТМЫ SMOOTHGRAD ДЛЯ СЛОЕВ
+# ==========================================
+
+def manual_layer_smoothgrad(model, extractor, img_tensor, target_class_idx, n_samples=50, noise_level=0.15, use_guided=False):
+    guided_hooks = []
+    if use_guided:
+        def guided_relu_hook(module, grad_in, grad_out):
+            if grad_in[0] is not None:
+                return (torch.clamp(grad_in[0], min=0.0),)
+        for module in model.modules():
+            if isinstance(module, nn.ReLU):
+                guided_hooks.append(module.register_full_backward_hook(guided_relu_hook))
+                
+    std = noise_level * (img_tensor.max() - img_tensor.min()).item()
+    extractor.clear_gradients()
+    
+    for i in range(n_samples):
+        noise = torch.randn_like(img_tensor) * std
+        noisy_img = (img_tensor + noise).requires_grad_(True)
+        
+        model.zero_grad()
+        output = model(noisy_img)
+        score = output[0, target_class_idx]
+        score.backward() # Хуки экстрэктора сами поймают градиенты слоев
+        
+    for hook in guided_hooks:
+        hook.remove()
+        
+    return {name: grad / n_samples for name, grad in extractor.gradients.items()}
+
+import torchvision.transforms as T
+def manual_layer_smooth_ig(model, extractor, img_tensor, target_class_idx, n_samples=15, steps=15, noise_level=0.15):
+    """Реализация SmoothGrad + Integrated Gradients для глубоких слоев"""
+    std = noise_level * (img_tensor.max() - img_tensor.min()).item()
+    # baseline = torch.zeros_like(img_tensor)
+    blurrer = T.GaussianBlur(kernel_size=(51, 51), sigma=(10.0, 10.0))
+    baseline = blurrer(img_tensor)
+    # Получаем базовые активации
+    model.zero_grad()
+    _ = model(baseline)
+    baseline_acts = {name: extractor.activations[name].clone() for name in extractor.layers_dict}
+    
+    total_ig = {name: 0.0 for name in extractor.layers_dict}
+    
+    for i in range(n_samples):
+        noise = torch.randn_like(img_tensor) * std
+        noisy_img = img_tensor + noise
+        
+        # Получаем активации зашумленной картинки
+        model.zero_grad()
+        _ = model(noisy_img)
+        target_acts = {name: extractor.activations[name].clone() for name in extractor.layers_dict}
+        
+        # Вычисляем интеграл
+        extractor.clear_gradients()
+        for alpha in torch.linspace(0.0, 1.0, steps):
+            interpolated = baseline + alpha * (noisy_img - baseline)
+            interpolated.requires_grad_(True)
+            
+            model.zero_grad()
+            out = model(interpolated)
+            score = out[0, target_class_idx]
+            score.backward()
+            
+        # Формула IG: (Активация - Баз.Активация) * Интеграл Градиентов
+        for name in extractor.layers_dict:
+            avg_grad = extractor.gradients[name] / steps
+            ig = (target_acts[name] - baseline_acts[name]) * avg_grad
+            total_ig[name] += ig
+            
+    return {name: ig / n_samples for name, ig in total_ig.items()}
+
+# ==========================================
+# 4. ЗАПУСК И ВИЗУАЛИЗАЦИЯ
+# ==========================================
+print("Считаем Standard SmoothGrad...")
+res_standard = manual_layer_smoothgrad(model, extractor, input_tensor, target_class, use_guided=False)
+
+print("Считаем Guided SmoothGrad...")
+res_guided = manual_layer_smoothgrad(model, extractor, input_tensor, target_class, use_guided=True)
+
+print("Считаем SmoothIG (Integrated Gradients)...")
+res_ig = manual_layer_smooth_ig(model, extractor, input_tensor, target_class)
+
+extractor.remove_hooks() # Убираем мусор из модели
+
+# Функция превращения тензора слоя в тепловую карту
+def process_layer_heatmap(layer_tensor, img_size=(224, 224)):
+    t = torch.abs(layer_tensor).squeeze(0) 
+    t = torch.sum(t, dim=0, keepdim=True).unsqueeze(0) 
+    t = F.interpolate(t, size=img_size, mode='bilinear', align_corners=False)
+    heatmap = t.squeeze().cpu().numpy()
+    
+    # 1. Режем 1% аномальных выбросов, чтобы они не сожрали всю яркость
+    vmax = np.percentile(heatmap, 99.5)
+    vmin = np.min(heatmap)
+    
+    # 2. Динамическая защита от деления на ноль для микро-чисел
+    denominator = vmax - vmin
+    if denominator < 1e-15:
+        return np.zeros_like(heatmap) # Если сигнал реально мертв
+        
+    # 3. Нормализуем то, что осталось
+    heatmap = np.clip(heatmap, vmin, vmax)
+    return (heatmap - vmin) / denominator
+
+vis_preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224)
+])
+img_vis = vis_preprocess(img_pil)
+
+fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+methods = [
+    ("Standard SmoothGrad", res_standard),
+    ("Guided SmoothGrad", res_guided),
+    ("SmoothIG", res_ig)
+]
+
+for row_idx, (method_name, method_results) in enumerate(methods):
+    axes[row_idx, 0].imshow(img_vis)
+    axes[row_idx, 0].set_title(f"Оригинал\n[{method_name}]")
+    axes[row_idx, 0].axis('off')
+    
+    for col_idx, layer_name in enumerate(target_layers.keys(), start=1):
+        heatmap = process_layer_heatmap(method_results[layer_name])
+        axes[row_idx, col_idx].imshow(img_vis)
+        axes[row_idx, col_idx].imshow(heatmap, cmap='jet', alpha=0.5, interpolation='bicubic')
+        axes[row_idx, col_idx].set_title(f"{layer_name}\n[{method_name}]")
+        axes[row_idx, col_idx].axis('off')
+        
+plt.tight_layout()
+plt.show()
