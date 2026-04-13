@@ -1,33 +1,101 @@
-from sklearn.model_selection import cross_val_predict
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import pandas as pd
+import numpy as np
+import optuna
+from catboost import CatBoostClassifier, Pool
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import train_test_split
 
-print("\n--- ЧАСТЬ 8: Сдвиг порога с кросс-валидацией (Out-of-Fold) ---")
+print("\n--- ЧАСТЬ 9: Интеллектуальный подбор параметров (CatBoost + Optuna) ---")
 
-# 1. Задаем порог, который хотим проверить (например, 15% уверенности)
-# Попробуйте поменять на 0.10 или 0.05, если Recall будет недостаточным.
-CUSTOM_THRESHOLD = 0.15 
-print(f"Вычисляем метрики CV для порога: {CUSTOM_THRESHOLD * 100}%...\n")
+# 1. Подготовка данных специально для CatBoost
+# CatBoost не нужен сложный ColumnTransformer и масштабирование!
+# Ему нужно только указать, какие колонки являются категориальными (текстовыми)
 
-# 2. Получаем вероятности для ВСЕГО датасета честным путем через кросс-валидацию.
-# Используем наш стандартный пайплайн (без scale_pos_weight)
-y_proba_cv = cross_val_predict(
-    pipeline_xgb, 
-    X, y, 
-    cv=cv_strategy, 
-    method='predict_proba', 
-    n_jobs=-1
-)[:, 1]
+# Если вы использовали df_model или df_fe с новыми фичами, используйте его. 
+# Здесь я пишу на базе исходного чистого df.
+X = df.drop(columns=['attack_detected'])
+y = df['attack_detected']
 
-# 3. Применяем наш порог: если вероятность >= порога, ставим 1 (Атака)
-y_pred_cv_custom = (y_proba_cv >= CUSTOM_THRESHOLD).astype(int)
+# Указываем CatBoost названия колонок с категориями
+categorical_features = ['protocol_type', 'encryption_used', 'browser_type']
 
-# 4. Оцениваем результат сравнением истинных y и предсказанных
-print("Матрица ошибок (на всех фолдах суммарно):")
-print(confusion_matrix(y, y_pred_cv_custom))
+# 2. Разделяем на train и test (80/20)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-print("\nОтчет о классификации (Classification Report):")
-print(classification_report(y, y_pred_cv_custom, digits=4))
+# 3. Функция для Optuna (Здесь Optuna будет проводить эксперименты)
+def objective(trial):
+    # Пространство поиска параметров
+    param = {
+        "iterations": trial.suggest_int("iterations", 200, 800),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        "depth": trial.suggest_int("depth", 4, 8),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
+        # Разрешаем Optuna самой подобрать штраф за пропуск атаки от 1.0 до 4.0!
+        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 4.0),
+        "cat_features": categorical_features,
+        "eval_metric": "AUC",
+        "random_seed": 42,
+        "logging_level": "Silent" # Отключаем спам в консоли
+    }
 
-# ROC-AUC не зависит от сдвига порога, он оценивает сами вероятности
-roc_auc_cv = roc_auc_score(y, y_proba_cv)
-print(f"ROC-AUC (OOF): {roc_auc_cv:.4f}")
+    # Используем кросс-валидацию внутри каждого эксперимента для честной оценки
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    cv_scores = []
+    
+    for train_idx, val_idx in cv.split(X_train, y_train):
+        X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
+        X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+        
+        # Обучаем модель с предложенными параметрами
+        model = CatBoostClassifier(**param)
+        model.fit(
+            X_tr, y_tr, 
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=50 # Останавливаем, если модель перестала улучшаться
+        )
+        
+        # Оцениваем ROC-AUC
+        preds_proba = model.predict_proba(X_val)[:, 1]
+        score = roc_auc_score(y_val, preds_proba)
+        cv_scores.append(score)
+        
+    # Возвращаем средний ROC-AUC по фолдам. Optuna будет пытаться его максимизировать!
+    return np.mean(cv_scores)
+
+# 4. Запускаем Optuna
+print("Запуск Optuna (Ищем идеальные параметры, это займет пару минут)...")
+study = optuna.create_study(direction="maximize")
+# Запускаем 30 экспериментов (trials). Если есть время, можно поставить 50.
+study.optimize(objective, n_trials=30, show_progress_bar=True) 
+
+print("\nОптимизация завершена!")
+print("Лучшие параметры:", study.best_params)
+print(f"Лучший ROC-AUC на кросс-валидации: {study.best_value:.4f}")
+
+# 5. Обучаем финальную модель с лучшими параметрами на всем X_train
+print("\nОбучение финальной модели CatBoost...")
+best_params = study.best_params
+best_params['cat_features'] = categorical_features
+best_params['random_seed'] = 42
+best_params['logging_level'] = 'Silent'
+
+final_model = CatBoostClassifier(**best_params)
+final_model.fit(X_train, y_train)
+
+# 6. Оценка на отложенной тестовой выборке (X_test)
+y_pred = final_model.predict(X_test)
+y_proba = final_model.predict_proba(X_test)[:, 1]
+
+print("\n--- РЕЗУЛЬТАТЫ ФИНАЛЬНОЙ МОДЕЛИ (CatBoost) ---")
+print("Матрица ошибок:")
+print(confusion_matrix(y_test, y_pred))
+
+print("\nОтчет о классификации:")
+print(classification_report(y_test, y_pred, digits=4))
+print(f"Итоговый ROC-AUC на тесте: {roc_auc_score(y_test, y_proba):.4f}")
+
+# Выводим важность признаков
+feature_importances = final_model.get_feature_importance()
+for score, name in sorted(zip(feature_importances, X.columns), reverse=True):
+    print(f"{name}: {score:.2f}%")
