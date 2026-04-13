@@ -1,55 +1,37 @@
-import xgboost as xgb
-from sklearn.model_selection import cross_validate, StratifiedKFold
+from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import precision_recall_curve
+import matplotlib.pyplot as plt
+import numpy as np
 
-print("\n--- ЧАСТЬ 4: Градиентный бустинг (XGBoost) ---")
+# Получаем вероятности предсказаний для всех данных с помощью кросс-валидации
+print("Вычисляем вероятности (OOF Predictions)...")
+y_proba_cv = cross_val_predict(pipeline_xgb, X, y, cv=cv_strategy, method='predict_proba', n_jobs=-1)[:, 1]
 
-# Используем тот же препроцессор, что и для регрессии, 
-# чтобы сравнение было честным
-pipeline_xgb = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', xgb.XGBClassifier(
-        n_estimators=200,          # Количество деревьев
-        max_depth=5,               # Максимальная глубина дерева (не берем слишком глубокие, чтобы не переобучиться)
-        learning_rate=0.1,         # Скорость обучения
-        random_state=42,
-        eval_metric='logloss',
-        n_jobs=-1                  # Использовать все ядра процессора
-    ))
-])
+# Рассчитываем Precision и Recall для ВСЕХ возможных порогов от 0.0 до 1.0
+precisions, recalls, thresholds = precision_recall_curve(y, y_proba_cv)
 
-# Те же настройки кросс-валидации
-cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-scoring_metrics = ['precision', 'recall', 'roc_auc', 'f1']
-
-print("Обучение XGBoost (5-Fold Cross-Validation)...")
-cv_results_xgb = cross_validate(
-    pipeline_xgb, 
-    X, y, 
-    cv=cv_strategy, 
-    scoring=scoring_metrics,
-    n_jobs=-1
-)
-
-# Выводим результаты
-print("\n--- РЕЗУЛЬТАТЫ XGBOOST ---")
-print(f"Mean Precision: {cv_results_xgb['test_precision'].mean():.4f} (+/- {cv_results_xgb['test_precision'].std() * 2:.4f})")
-print(f"Mean Recall:    {cv_results_xgb['test_recall'].mean():.4f} (+/- {cv_results_xgb['test_recall'].std() * 2:.4f})")
-print(f"Mean F1:        {cv_results_xgb['test_f1'].mean():.4f} (+/- {cv_results_xgb['test_f1'].std() * 2:.4f})")
-print(f"Mean ROC-AUC:   {cv_results_xgb['test_roc_auc'].mean():.4f} (+/- {cv_results_xgb['test_roc_auc'].std() * 2:.4f})")
-
-# ---------------------------------------------------------
-# Бонус: Обучаем модель на всех данных, чтобы посмотреть Feature Importance
-# ---------------------------------------------------------
-pipeline_xgb.fit(X, y)
-# Извлекаем названия признаков после трансформации
-feature_names = pipeline_xgb.named_steps['preprocessor'].get_feature_names_out()
-# Извлекаем важность признаков из самого XGBoost
-importances = pipeline_xgb.named_steps['classifier'].feature_importances_
-
-# Строим красивый график важности
+# Строим график компромисса
 plt.figure(figsize=(10, 6))
-sns.barplot(x=importances, y=feature_names)
-plt.title('Важность признаков (Feature Importance) по версии XGBoost')
-plt.xlabel('Вес признака')
-plt.tight_layout()
+plt.plot(thresholds, precisions[:-1], "b--", label="Precision (Точность)", linewidth=2)
+plt.plot(thresholds, recalls[:-1], "g-", label="Recall (Полнота)", linewidth=2)
+
+# Находим порог, при котором Recall будет около 0.90 (90%)
+target_recall = 0.90
+# Ищем индекс, где recall максимально близок к 90%
+idx = np.argmin(np.abs(recalls - target_recall))
+optimal_threshold = thresholds[idx]
+expected_precision = precisions[idx]
+
+plt.axvline(x=optimal_threshold, color='r', linestyle=':', label=f'Порог {optimal_threshold:.2f}')
+plt.plot([optimal_threshold], [target_recall], 'ro')
+
+plt.title('Баланс Precision и Recall в зависимости от порога')
+plt.xlabel('Порог вероятности (Threshold)')
+plt.ylabel('Значение метрики')
+plt.legend(loc="lower left")
+plt.grid(True)
 plt.show()
+
+print(f"Если мы снизим порог до {optimal_threshold:.2f}:")
+print(f"-> Recall вырастет до ~{recalls[idx]:.3f} (Мы поймаем почти все атаки)")
+print(f"-> Precision упадет до ~{expected_precision:.3f} (Доля ложных тревог)")
