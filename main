@@ -1,37 +1,27 @@
-from sklearn.model_selection import cross_val_predict
-from sklearn.metrics import precision_recall_curve
-import matplotlib.pyplot as plt
-import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
 
-# Получаем вероятности предсказаний для всех данных с помощью кросс-валидации
-print("Вычисляем вероятности (OOF Predictions)...")
-y_proba_cv = cross_val_predict(pipeline_xgb, X, y, cv=cv_strategy, method='predict_proba', n_jobs=-1)[:, 1]
+print("\n--- ЧАСТЬ 7: Ручное управление порогом чувствительности ---")
 
-# Рассчитываем Precision и Recall для ВСЕХ возможных порогов от 0.0 до 1.0
-precisions, recalls, thresholds = precision_recall_curve(y, y_proba_cv)
+# 1. Убедимся, что у нас есть обученная модель и тестовые данные
+# Используем наш стандартный XGBoost (без весов)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+pipeline_xgb.fit(X_train, y_train)
 
-# Строим график компромисса
-plt.figure(figsize=(10, 6))
-plt.plot(thresholds, precisions[:-1], "b--", label="Precision (Точность)", linewidth=2)
-plt.plot(thresholds, recalls[:-1], "g-", label="Recall (Полнота)", linewidth=2)
+# 2. Получаем сырые вероятности (от 0.0 до 1.0), а не готовые классы (0 или 1)
+# Берем колонку [:, 1] - это вероятность того, что класс равен 1 (Атака)
+y_proba_test = pipeline_xgb.predict_proba(X_test)[:, 1]
 
-# Находим порог, при котором Recall будет около 0.90 (90%)
-target_recall = 0.90
-# Ищем индекс, где recall максимально близок к 90%
-idx = np.argmin(np.abs(recalls - target_recall))
-optimal_threshold = thresholds[idx]
-expected_precision = precisions[idx]
+# 3. Задаем наш кастомный порог (например, 15% уверенности)
+# Вы можете менять эту цифру!
+CUSTOM_THRESHOLD = 0.15 
 
-plt.axvline(x=optimal_threshold, color='r', linestyle=':', label=f'Порог {optimal_threshold:.2f}')
-plt.plot([optimal_threshold], [target_recall], 'ro')
+# Если вероятность >= 0.15, ставим 1 (Атака), иначе 0 (Норма)
+y_pred_custom = (y_proba_test >= CUSTOM_THRESHOLD).astype(int)
 
-plt.title('Баланс Precision и Recall в зависимости от порога')
-plt.xlabel('Порог вероятности (Threshold)')
-plt.ylabel('Значение метрики')
-plt.legend(loc="lower left")
-plt.grid(True)
-plt.show()
+# 4. Выводим результаты
+print(f"Результаты при пороге уверенности = {CUSTOM_THRESHOLD * 100}%:\n")
+print("Матрица ошибок (Confusion Matrix):")
+print(confusion_matrix(y_test, y_pred_custom))
 
-print(f"Если мы снизим порог до {optimal_threshold:.2f}:")
-print(f"-> Recall вырастет до ~{recalls[idx]:.3f} (Мы поймаем почти все атаки)")
-print(f"-> Precision упадет до ~{expected_precision:.3f} (Доля ложных тревог)")
+print("\nОтчет о классификации:")
+print(classification_report(y_test, y_pred_custom))
