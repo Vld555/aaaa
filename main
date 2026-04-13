@@ -1,27 +1,33 @@
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 
-print("\n--- ЧАСТЬ 7: Ручное управление порогом чувствительности ---")
+print("\n--- ЧАСТЬ 8: Сдвиг порога с кросс-валидацией (Out-of-Fold) ---")
 
-# 1. Убедимся, что у нас есть обученная модель и тестовые данные
-# Используем наш стандартный XGBoost (без весов)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-pipeline_xgb.fit(X_train, y_train)
-
-# 2. Получаем сырые вероятности (от 0.0 до 1.0), а не готовые классы (0 или 1)
-# Берем колонку [:, 1] - это вероятность того, что класс равен 1 (Атака)
-y_proba_test = pipeline_xgb.predict_proba(X_test)[:, 1]
-
-# 3. Задаем наш кастомный порог (например, 15% уверенности)
-# Вы можете менять эту цифру!
+# 1. Задаем порог, который хотим проверить (например, 15% уверенности)
+# Попробуйте поменять на 0.10 или 0.05, если Recall будет недостаточным.
 CUSTOM_THRESHOLD = 0.15 
+print(f"Вычисляем метрики CV для порога: {CUSTOM_THRESHOLD * 100}%...\n")
 
-# Если вероятность >= 0.15, ставим 1 (Атака), иначе 0 (Норма)
-y_pred_custom = (y_proba_test >= CUSTOM_THRESHOLD).astype(int)
+# 2. Получаем вероятности для ВСЕГО датасета честным путем через кросс-валидацию.
+# Используем наш стандартный пайплайн (без scale_pos_weight)
+y_proba_cv = cross_val_predict(
+    pipeline_xgb, 
+    X, y, 
+    cv=cv_strategy, 
+    method='predict_proba', 
+    n_jobs=-1
+)[:, 1]
 
-# 4. Выводим результаты
-print(f"Результаты при пороге уверенности = {CUSTOM_THRESHOLD * 100}%:\n")
-print("Матрица ошибок (Confusion Matrix):")
-print(confusion_matrix(y_test, y_pred_custom))
+# 3. Применяем наш порог: если вероятность >= порога, ставим 1 (Атака)
+y_pred_cv_custom = (y_proba_cv >= CUSTOM_THRESHOLD).astype(int)
 
-print("\nОтчет о классификации:")
-print(classification_report(y_test, y_pred_custom))
+# 4. Оцениваем результат сравнением истинных y и предсказанных
+print("Матрица ошибок (на всех фолдах суммарно):")
+print(confusion_matrix(y, y_pred_cv_custom))
+
+print("\nОтчет о классификации (Classification Report):")
+print(classification_report(y, y_pred_cv_custom, digits=4))
+
+# ROC-AUC не зависит от сдвига порога, он оценивает сами вероятности
+roc_auc_cv = roc_auc_score(y, y_proba_cv)
+print(f"ROC-AUC (OOF): {roc_auc_cv:.4f}")
