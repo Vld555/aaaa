@@ -1,101 +1,79 @@
 import pandas as pd
-import numpy as np
-import optuna
-from catboost import CatBoostClassifier, Pool
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.feature_extraction.text import CountVectorizer
 
-print("\n--- ЧАСТЬ 9: Интеллектуальный подбор параметров (CatBoost + Optuna) ---")
+# Настройки для графиков
+sns.set_theme(style="whitegrid")
 
-# 1. Подготовка данных специально для CatBoost
-# CatBoost не нужен сложный ColumnTransformer и масштабирование!
-# Ему нужно только указать, какие колонки являются категориальными (текстовыми)
-
-# Если вы использовали df_model или df_fe с новыми фичами, используйте его. 
-# Здесь я пишу на базе исходного чистого df.
-X = df.drop(columns=['attack_detected'])
-y = df['attack_detected']
-
-# Указываем CatBoost названия колонок с категориями
-categorical_features = ['protocol_type', 'encryption_used', 'browser_type']
-
-# 2. Разделяем на train и test (80/20)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-# 3. Функция для Optuna (Здесь Optuna будет проводить эксперименты)
-def objective(trial):
-    # Пространство поиска параметров
-    param = {
-        "iterations": trial.suggest_int("iterations", 200, 800),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        "depth": trial.suggest_int("depth", 4, 8),
-        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
-        # Разрешаем Optuna самой подобрать штраф за пропуск атаки от 1.0 до 4.0!
-        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 4.0),
-        "cat_features": categorical_features,
-        "eval_metric": "AUC",
-        "random_seed": 42,
-        "logging_level": "Silent" # Отключаем спам в консоли
-    }
-
-    # Используем кросс-валидацию внутри каждого эксперимента для честной оценки
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-    cv_scores = []
+def simple_text_eda(df, text_col='text', label_col='label'):
+    """
+    Простой скрипт для разведочного анализа текста (бинарная классификация).
+    df: pandas DataFrame
+    text_col: название колонки с текстом
+    label_col: название колонки с таргетом (0 или 1)
+    """
     
-    for train_idx, val_idx in cv.split(X_train, y_train):
-        X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
-        X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+    print("=== 1. Базовая статистика и баланс классов ===")
+    print(f"Всего записей: {len(df)}")
+    print(f"Пустых значений в текстах: {df[text_col].isnull().sum()}")
+    print(f"Полных дубликатов строк: {df.duplicated().sum()}")
+    
+    # Распределение классов
+    class_counts = df[label_col].value_counts()
+    print("\nБаланс классов:")
+    print(class_counts.to_string())
+    
+    plt.figure(figsize=(6, 4))
+    sns.barplot(x=class_counts.index, y=class_counts.values, palette='viridis')
+    plt.title('Распределение классов')
+    plt.xlabel('Класс (Label)')
+    plt.ylabel('Количество')
+    plt.show()
+
+    print("\n=== 2. Анализ длины текстов ===")
+    # Считаем количество слов (по пробелам) и символов
+    df['word_count'] = df[text_col].astype(str).apply(lambda x: len(x.split()))
+    df['char_count'] = df[text_col].astype(str).apply(len)
+    
+    print("Статистика по количеству слов:")
+    print(df.groupby(label_col)['word_count'].describe()[['mean', 'min', 'max']])
+    
+    # График распределения длины слов по классам
+    plt.figure(figsize=(10, 5))
+    sns.histplot(data=df, x='word_count', hue=label_col, kde=True, bins=50, palette='viridis')
+    plt.title('Распределение количества слов в зависимости от класса')
+    plt.xlabel('Количество слов')
+    plt.ylabel('Плотность')
+    # Ограничим X, чтобы выбросы (очень длинные тексты) не сплющили график
+    plt.xlim(0, df['word_count'].quantile(0.95)) 
+    plt.show()
+
+    print("\n=== 3. Топ частых слов (Униграммы) ===")
+    # Используем CountVectorizer для подсчета слов, исключая английские и русские стоп-слова
+    # (если тексты на русском, можно убрать 'english' или использовать nltk для русских стоп-слов)
+    vectorizer = CountVectorizer(stop_words='english', max_features=20)
+    
+    for label in [0, 1]:
+        print(f"\nТоп-10 слов для класса {label}:")
+        texts = df[df[label_col] == label][text_col].dropna().astype(str)
         
-        # Обучаем модель с предложенными параметрами
-        model = CatBoostClassifier(**param)
-        model.fit(
-            X_tr, y_tr, 
-            eval_set=(X_val, y_val),
-            early_stopping_rounds=50 # Останавливаем, если модель перестала улучшаться
-        )
+        if len(texts) == 0:
+            continue
+            
+        word_matrix = vectorizer.fit_transform(texts)
+        word_frequencies = sum(word_matrix).toarray()[0]
         
-        # Оцениваем ROC-AUC
-        preds_proba = model.predict_proba(X_val)[:, 1]
-        score = roc_auc_score(y_val, preds_proba)
-        cv_scores.append(score)
+        # Собираем в датафрейм для удобства
+        freq_df = pd.DataFrame({
+            'word': vectorizer.get_feature_names_out(),
+            'count': word_frequencies
+        }).sort_values(by='count', ascending=False).head(10)
         
-    # Возвращаем средний ROC-AUC по фолдам. Optuna будет пытаться его максимизировать!
-    return np.mean(cv_scores)
+        print(freq_df.to_string(index=False))
 
-# 4. Запускаем Optuna
-print("Запуск Optuna (Ищем идеальные параметры, это займет пару минут)...")
-study = optuna.create_study(direction="maximize")
-# Запускаем 30 экспериментов (trials). Если есть время, можно поставить 50.
-study.optimize(objective, n_trials=30, show_progress_bar=True) 
-
-print("\nОптимизация завершена!")
-print("Лучшие параметры:", study.best_params)
-print(f"Лучший ROC-AUC на кросс-валидации: {study.best_value:.4f}")
-
-# 5. Обучаем финальную модель с лучшими параметрами на всем X_train
-print("\nОбучение финальной модели CatBoost...")
-best_params = study.best_params
-best_params['cat_features'] = categorical_features
-best_params['random_seed'] = 42
-best_params['logging_level'] = 'Silent'
-
-final_model = CatBoostClassifier(**best_params)
-final_model.fit(X_train, y_train)
-
-# 6. Оценка на отложенной тестовой выборке (X_test)
-y_pred = final_model.predict(X_test)
-y_proba = final_model.predict_proba(X_test)[:, 1]
-
-print("\n--- РЕЗУЛЬТАТЫ ФИНАЛЬНОЙ МОДЕЛИ (CatBoost) ---")
-print("Матрица ошибок:")
-print(confusion_matrix(y_test, y_pred))
-
-print("\nОтчет о классификации:")
-print(classification_report(y_test, y_pred, digits=4))
-print(f"Итоговый ROC-AUC на тесте: {roc_auc_score(y_test, y_proba):.4f}")
-
-# Выводим важность признаков
-feature_importances = final_model.get_feature_importance()
-for score, name in sorted(zip(feature_importances, X.columns), reverse=True):
-    print(f"{name}: {score:.2f}%")
+# --- Как использовать: ---
+# 1. Загрузи свои данные
+# my_data = pd.read_csv('my_dataset.csv')
+# 2. Вызови функцию, указав названия колонок
+# simple_text_eda(my_data, text_col='твой_текст', label_col='твой_таргет')
